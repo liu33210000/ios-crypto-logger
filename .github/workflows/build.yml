@@ -28,23 +28,20 @@ jobs:
 
       - name: Download iOS SDK
         run: |
-          # 下载官方 iOS SDK (这是修复的关键)
+          # 下载官方 iOS SDK
           git clone --depth 1 https://github.com/theos/sdks.git temp_sdks
           mv temp_sdks/*.sdk $HOME/theos/sdks/
           rm -rf temp_sdks
         env:
           THEOS: ${{ env.THEOS }}
-      - name: Fix Line Endings
-              run: |
-                        find . -type f -exec sed -i '' 's/\r$//' {} + || true
-                        
+
       - name: Build Package
         run: |
-          # 尝试进入 source_code 目录，避免目录找不到
+          # 尝试进入 source_code 目录，如果不存在则在当前目录编译
           if [ -d "source_code" ]; then
             cd source_code
           fi
-          # 强制编译
+          # 禁用签名检查，强制编译
           make package FINALPACKAGE=1 DEBUG=0
         env:
           THEOS: ${{ env.THEOS }}
