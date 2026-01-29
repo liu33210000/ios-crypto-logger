@@ -34,7 +34,10 @@ jobs:
           rm -rf temp_sdks
         env:
           THEOS: ${{ env.THEOS }}
-
+      - name: Fix Line Endings
+              run: |
+                        find . -type f -exec sed -i '' 's/\r$//' {} + || true
+                        
       - name: Build Package
         run: |
           # 尝试进入 source_code 目录，避免目录找不到
