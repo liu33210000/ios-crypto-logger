@@ -6,6 +6,6 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = EnhancedCryptoLogger
 
 EnhancedCryptoLogger_FILES = Tweak.x
-EnhancedCryptoLogger_CFLAGS = -fobjc-arc
+EnhancedCryptoLogger_CFLAGS = -fobjc-arc -Wno-error
 
 include $(THEOS_MAKE_PATH)/tweak.mk
