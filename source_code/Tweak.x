@@ -16,7 +16,7 @@
 @implementation LogManager {
     NSFileHandle *_fileHandle;
     NSString *_logPath;
-    NSLock *_lock;
+    dispatch_queue_t _writeQueue; // Serial queue for async writes
 }
 
 + (instancetype)sharedInstance {
@@ -30,16 +30,25 @@
 
 - (instancetype)init {
     if (self = [super init]) {
-        _lock = [[NSLock alloc] init];
+        // Create a dedicated serial queue for file writes (won't block caller)
+        _writeQueue = dispatch_queue_create("com.cryptomonitor.logqueue", DISPATCH_QUEUE_SERIAL);
+        
         NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
         NSString *docsDir = [paths firstObject];
         _logPath = [docsDir stringByAppendingPathComponent:@"crypto_monitor.log"];
         
-        if (![[NSFileManager defaultManager] fileExistsAtPath:_logPath]) {
-            [@"" writeToFile:_logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        }
-        _fileHandle = [NSFileHandle fileHandleForWritingAtPath:_logPath];
-        [_fileHandle seekToEndOfFile];
+        // Initialize file asynchronously to avoid blocking during load
+        dispatch_async(_writeQueue, ^{
+            @try {
+                if (![[NSFileManager defaultManager] fileExistsAtPath:self->_logPath]) {
+                    [@"" writeToFile:self->_logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                }
+                self->_fileHandle = [NSFileHandle fileHandleForWritingAtPath:self->_logPath];
+                [self->_fileHandle seekToEndOfFile];
+            } @catch (NSException *e) {
+                NSLog(@"[CryptoMonitor] Failed to init log file: %@", e);
+            }
+        });
     }
     return self;
 }
@@ -52,13 +61,19 @@
     
     NSString *timestampedLog = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], logLine];
     
-    [_lock lock];
-    NSData *data = [timestampedLog dataUsingEncoding:NSUTF8StringEncoding];
-    [_fileHandle writeData:data];
-    // In a real high-perf scenario, might want to buffer this, but for now flush to ensure safety
-    // [_fileHandle synchronizeFile]; 
-    [_lock unlock];
+    // Write asynchronously to not block the caller (hooks)
+    dispatch_async(_writeQueue, ^{
+        @try {
+            if (self->_fileHandle) {
+                NSData *data = [timestampedLog dataUsingEncoding:NSUTF8StringEncoding];
+                [self->_fileHandle writeData:data];
+            }
+        } @catch (NSException *e) {
+            // Silently ignore write failures to prevent crashes
+        }
+    });
     
+    // Console log is fast, can stay synchronous
     NSLog(@"[CryptoMonitor] %@", logLine);
 }
 
@@ -67,30 +82,50 @@
 }
 
 - (NSString *)getLogContent {
-    [_lock lock];
-    NSString *content = [NSString stringWithContentsOfFile:_logPath encoding:NSUTF8StringEncoding error:nil];
-    [_lock unlock];
+    __block NSString *content = @"";
+    dispatch_sync(_writeQueue, ^{
+        content = [NSString stringWithContentsOfFile:self->_logPath encoding:NSUTF8StringEncoding error:nil] ?: @"";
+    });
     return content;
 }
 
 - (void)clearLogs {
-    [_lock lock];
-    [@"" writeToFile:_logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    [_fileHandle closeFile];
-    _fileHandle = [NSFileHandle fileHandleForWritingAtPath:_logPath];
-    [_lock unlock];
+    dispatch_async(_writeQueue, ^{
+        @try {
+            [@"" writeToFile:self->_logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [self->_fileHandle closeFile];
+            self->_fileHandle = [NSFileHandle fileHandleForWritingAtPath:self->_logPath];
+        } @catch (NSException *e) {
+            NSLog(@"[CryptoMonitor] Failed to clear logs: %@", e);
+        }
+    });
 }
 
 @end
 
 // MARK: - Utilities
 
+// Max bytes to log per data block to prevent memory exhaustion
+static const size_t kMaxLogDataLength = 256;
+
 NSString *DataToHex(const void *data, size_t length) {
-    if (!data || length == 0) return @"";
+    if (!data || length == 0) return @"(null)";
+    
+    BOOL truncated = NO;
+    size_t displayLength = length;
+    if (displayLength > kMaxLogDataLength) {
+        displayLength = kMaxLogDataLength;
+        truncated = YES;
+    }
+    
     const unsigned char *buffer = (const unsigned char *)data;
-    NSMutableString *hexString = [NSMutableString stringWithCapacity:length * 2];
-    for (size_t i = 0; i < length; i++) {
+    NSMutableString *hexString = [NSMutableString stringWithCapacity:displayLength * 2 + 20];
+    for (size_t i = 0; i < displayLength; i++) {
         [hexString appendFormat:@"%02x", buffer[i]];
+    }
+    
+    if (truncated) {
+        [hexString appendFormat:@"...(%zu bytes total)", length];
     }
     return hexString;
 }
@@ -133,20 +168,39 @@ NSString *DataToHex(const void *data, size_t length) {
     return status;
 }
 
-// 4. Base64
+// 4. Base64 - with throttling to avoid performance issues
+// Base64 is called VERY frequently by iOS system internals
+
+static NSTimeInterval g_lastBase64Log = 0;
+static const NSTimeInterval kBase64LogInterval = 0.1; // Max 10 logs per second
+
+static NSString *TruncateString(NSString *str, NSUInteger maxLen) {
+    if (str.length <= maxLen) return str;
+    return [NSString stringWithFormat:@"%@...(+%lu chars)", [str substringToIndex:maxLen], (unsigned long)(str.length - maxLen)];
+}
+
+static BOOL ShouldLogBase64(void) {
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - g_lastBase64Log >= kBase64LogInterval) {
+        g_lastBase64Log = now;
+        return YES;
+    }
+    return NO;
+}
+
 %hook NSData
 - (id)initWithBase64EncodedString:(NSString *)base64String options:(NSDataBase64DecodingOptions)options {
     id result = %orig;
-    if (result) {
-        [[LogManager sharedInstance] log:@"[Base64Decode] In: %@ -> Out: %@", base64String, DataToHex([result bytes], [result length])];
+    if (result && ShouldLogBase64()) {
+        [[LogManager sharedInstance] log:@"[Base64Decode] In: %@ -> Out: %@", TruncateString(base64String, 128), DataToHex([result bytes], [result length])];
     }
     return result;
 }
 
 - (NSString *)base64EncodedStringWithOptions:(NSDataBase64EncodingOptions)options {
     NSString *result = %orig;
-    if (self.length > 0) {
-        [[LogManager sharedInstance] log:@"[Base64Encode] In: %@ -> Out: %@", DataToHex([self bytes], [self length]), result];
+    if (self.length > 0 && ShouldLogBase64()) {
+        [[LogManager sharedInstance] log:@"[Base64Encode] In: %@ -> Out: %@", DataToHex([self bytes], [self length]), TruncateString(result, 128)];
     }
     return result;
 }
@@ -264,6 +318,7 @@ NSString *DataToHex(const void *data, size_t length) {
 @interface FloatingController : NSObject
 @property (nonatomic, strong) FloatingWindow *window;
 @property (nonatomic, strong) UIButton *button;
+@property (nonatomic, assign) NSInteger retryCount;
 @end
 
 @implementation FloatingController
@@ -278,40 +333,117 @@ NSString *DataToHex(const void *data, size_t length) {
 }
 
 - (void)setup {
+    if (self.window != nil) return; // Already set up
+    
     dispatch_async(dispatch_get_main_queue(), ^{
-        self.window = [[FloatingWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-        self.window.windowLevel = UIWindowLevelAlert + 100; // Above almost everything
-        self.window.backgroundColor = [UIColor clearColor];
-        self.window.rootViewController = [[UIViewController alloc] init];
-        self.window.hidden = NO;
-        
-        self.button = [UIButton buttonWithType:UIButtonTypeCustom];
-        self.button.frame = CGRectMake(20, 100, 50, 50);
-        self.button.backgroundColor = [UIColor colorWithRed:0 green:0.5 blue:1 alpha:0.8];
-        self.button.layer.cornerRadius = 25;
-        self.button.layer.masksToBounds = YES;
-        [self.button setTitle:@"LOG" forState:UIControlStateNormal];
-        [self.button addTarget:self action:@selector(buttonTapped) forControlEvents:UIControlEventTouchUpInside];
-        
-        // Add pan gesture
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
-        [self.button addGestureRecognizer:pan];
-        
-        [self.window addSubview:self.button];
+        [self createWindowWithRetry];
     });
+}
+
+- (void)createWindowWithRetry {
+    // Try to get a valid window scene (iOS 13+)
+    UIWindowScene *scene = nil;
+    
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if (s.activationState == UISceneActivationStateForegroundActive && [s isKindOfClass:[UIWindowScene class]]) {
+                scene = (UIWindowScene *)s;
+                break;
+            }
+        }
+        
+        // Fallback: try any foreground scene
+        if (!scene) {
+            for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+                if ([s isKindOfClass:[UIWindowScene class]]) {
+                    scene = (UIWindowScene *)s;
+                    break;
+                }
+            }
+        }
+        
+        if (!scene) {
+            // No scene yet, retry after a delay (max 10 retries = 10 seconds)
+            if (self.retryCount < 10) {
+                self.retryCount++;
+                NSLog(@"[CryptoMonitor] No active scene yet, retry %ld...", (long)self.retryCount);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    [self createWindowWithRetry];
+                });
+            } else {
+                NSLog(@"[CryptoMonitor] Failed to find scene after 10 retries");
+            }
+            return;
+        }
+        
+        self.window = [[FloatingWindow alloc] initWithWindowScene:scene];
+    } else {
+        // iOS 12 and below
+        self.window = [[FloatingWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    }
+    
+    self.window.windowLevel = UIWindowLevelAlert + 100;
+    self.window.backgroundColor = [UIColor clearColor];
+    self.window.rootViewController = [[UIViewController alloc] init];
+    self.window.rootViewController.view.backgroundColor = [UIColor clearColor];
+    self.window.hidden = NO;
+    
+    // Make sure window is key and visible
+    if (@available(iOS 15.0, *)) {
+        // iOS 15+ needs makeKeyAndVisible for proper interaction
+        [self.window makeKeyAndVisible];
+    }
+    
+    self.button = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.button.frame = CGRectMake(20, 100, 50, 50);
+    self.button.backgroundColor = [UIColor colorWithRed:0 green:0.5 blue:1 alpha:0.8];
+    self.button.layer.cornerRadius = 25;
+    self.button.layer.masksToBounds = YES;
+    [self.button setTitle:@"LOG" forState:UIControlStateNormal];
+    [self.button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    self.button.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    [self.button addTarget:self action:@selector(buttonTapped) forControlEvents:UIControlEventTouchUpInside];
+    
+    // Add pan gesture
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+    [self.button addGestureRecognizer:pan];
+    
+    // Add to root view instead of window directly (safer)
+    [self.window.rootViewController.view addSubview:self.button];
+    
+    NSLog(@"[CryptoMonitor] Floating button created successfully");
 }
 
 - (void)handlePan:(UIPanGestureRecognizer *)p {
     UIView *btn = p.view;
-    CGPoint translation = [p translationInView:self.window];
-    btn.center = CGPointMake(btn.center.x + translation.x, btn.center.y + translation.y);
-    [p setTranslation:CGPointZero inView:self.window];
+    CGPoint translation = [p translationInView:self.window.rootViewController.view];
+    CGPoint newCenter = CGPointMake(btn.center.x + translation.x, btn.center.y + translation.y);
+    
+    // Keep button within screen bounds
+    CGRect bounds = self.window.bounds;
+    CGFloat halfWidth = btn.frame.size.width / 2;
+    CGFloat halfHeight = btn.frame.size.height / 2;
+    
+    newCenter.x = MAX(halfWidth, MIN(bounds.size.width - halfWidth, newCenter.x));
+    newCenter.y = MAX(halfHeight + 50, MIN(bounds.size.height - halfHeight - 50, newCenter.y)); // 50pt padding for safe areas
+    
+    btn.center = newCenter;
+    [p setTranslation:CGPointZero inView:self.window.rootViewController.view];
 }
 
 - (void)buttonTapped {
     LogViewController *vc = [[LogViewController alloc] init];
     vc.modalPresentationStyle = UIModalPresentationFullScreen;
-    [[self.window rootViewController] presentViewController:vc animated:YES completion:nil];
+    UIViewController *rootVC = self.window.rootViewController;
+    
+    // Make sure we can present
+    if (rootVC.presentedViewController) {
+        [rootVC dismissViewControllerAnimated:NO completion:^{
+            [rootVC presentViewController:vc animated:YES completion:nil];
+        }];
+    } else {
+        [rootVC presentViewController:vc animated:YES completion:nil];
+    }
 }
 
 @end
@@ -321,8 +453,9 @@ NSString *DataToHex(const void *data, size_t length) {
 
 %ctor {
     NSLog(@"[CryptoMonitor] Loaded");
-    // Initialize Floating UI with delay to ensure KeyWindow is ready-ish
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // Initialize Floating UI with delay to ensure app UI is ready
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [[FloatingController sharedInstance] setup];
     });
 }
+
