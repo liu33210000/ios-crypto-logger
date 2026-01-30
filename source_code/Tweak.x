@@ -421,7 +421,7 @@ static BOOL ShouldLogBase64(void) {
     self.window.backgroundColor = [UIColor clearColor];
     self.window.rootViewController = [[UIViewController alloc] init];
     self.window.rootViewController.view.backgroundColor = [UIColor clearColor];
-    self.window.rootViewController.view.userInteractionEnabled = NO; // CRITICAL: Let touches pass through root view
+    self.window.rootViewController.view.userInteractionEnabled = YES; // Enable so button (subview) works; FloatingWindow logic handles pass-through
     self.window.hidden = NO;
     
     // Make sure window is key and visible
