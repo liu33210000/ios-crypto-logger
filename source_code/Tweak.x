@@ -6,6 +6,7 @@
 // MARK: - Logger Interface
 
 @interface LogManager : NSObject
+@property (atomic, assign) BOOL isEnabled;
 + (instancetype)sharedInstance;
 - (void)log:(NSString *)format, ...;
 - (NSString *)getLogPath;
@@ -36,6 +37,7 @@
         NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
         NSString *docsDir = [paths firstObject];
         _logPath = [docsDir stringByAppendingPathComponent:@"crypto_monitor.log"];
+        _isEnabled = YES; // Default to enabled
         
         // Initialize file asynchronously to avoid blocking during load
         dispatch_async(_writeQueue, ^{
@@ -73,8 +75,8 @@
         }
     });
     
-    // Console log is fast, can stay synchronous
-    NSLog(@"[CryptoMonitor] %@", logLine);
+    // Console log is fast, can stay synchronous -> REMOVED to prevent main thread blocking
+    // NSLog(@"[CryptoMonitor] %@", logLine);
 }
 
 - (NSString *)getLogPath {
@@ -134,6 +136,7 @@ NSString *DataToHex(const void *data, size_t length) {
 
 // 1. MD5
 %hookf(unsigned char *, CC_MD5, const void *data, CC_LONG len, unsigned char *md) {
+    if (![LogManager sharedInstance].isEnabled) return %orig;
     unsigned char *result = %orig(data, len, md);
     if (len > 0) {
         [[LogManager sharedInstance] log:@"[MD5] Input: %@ -> Hash: %@", DataToHex(data, len), DataToHex(result, CC_MD5_DIGEST_LENGTH)];
@@ -143,6 +146,7 @@ NSString *DataToHex(const void *data, size_t length) {
 
 // 2. SHA256
 %hookf(unsigned char *, CC_SHA256, const void *data, CC_LONG len, unsigned char *md) {
+    if (![LogManager sharedInstance].isEnabled) return %orig;
     unsigned char *result = %orig(data, len, md);
     if (len > 0) {
         [[LogManager sharedInstance] log:@"[SHA256] Input: %@ -> Hash: %@", DataToHex(data, len), DataToHex(result, CC_SHA256_DIGEST_LENGTH)];
@@ -152,6 +156,7 @@ NSString *DataToHex(const void *data, size_t length) {
 
 // 3. CCCrypt (AES/DES etc)
 %hookf(CCCryptorStatus, CCCrypt, CCOperation op, CCAlgorithm alg, CCOptions options, const void *key, size_t keyLength, const void *iv, const void *dataIn, size_t dataInLength, void *dataOut, size_t dataOutAvailable, size_t *dataOutMoved) {
+    if (![LogManager sharedInstance].isEnabled) return %orig;
     CCCryptorStatus status = %orig(op, alg, options, key, keyLength, iv, dataIn, dataInLength, dataOut, dataOutAvailable, dataOutMoved);
     
     if (status == kCCSuccess) {
@@ -172,7 +177,7 @@ NSString *DataToHex(const void *data, size_t length) {
 // Base64 is called VERY frequently by iOS system internals
 
 static NSTimeInterval g_lastBase64Log = 0;
-static const NSTimeInterval kBase64LogInterval = 0.1; // Max 10 logs per second
+static const NSTimeInterval kBase64LogInterval = 1.0; // Increased to 1.0s to reduce lag
 
 static NSString *TruncateString(NSString *str, NSUInteger maxLen) {
     if (str.length <= maxLen) return str;
@@ -190,6 +195,7 @@ static BOOL ShouldLogBase64(void) {
 
 %hook NSData
 - (id)initWithBase64EncodedString:(NSString *)base64String options:(NSDataBase64DecodingOptions)options {
+    if (![LogManager sharedInstance].isEnabled) return %orig;
     id result = %orig;
     if (result && ShouldLogBase64()) {
         [[LogManager sharedInstance] log:@"[Base64Decode] In: %@ -> Out: %@", TruncateString(base64String, 128), DataToHex([result bytes], [result length])];
@@ -198,6 +204,7 @@ static BOOL ShouldLogBase64(void) {
 }
 
 - (NSString *)base64EncodedStringWithOptions:(NSDataBase64EncodingOptions)options {
+    if (![LogManager sharedInstance].isEnabled) return %orig;
     NSString *result = %orig;
     if (self.length > 0 && ShouldLogBase64()) {
         [[LogManager sharedInstance] log:@"[Base64Encode] In: %@ -> Out: %@", DataToHex([self bytes], [self length]), TruncateString(result, 128)];
@@ -261,7 +268,25 @@ static BOOL ShouldLogBase64(void) {
     self.textView.editable = NO;
     [self.view addSubview:self.textView];
     
+    // Logging Toggle Switch
+    UISwitch *logSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(self.view.frame.size.width - 70, 40, 50, 30)];
+    [logSwitch setOn:[LogManager sharedInstance].isEnabled];
+    [logSwitch addTarget:self action:@selector(loggingSwitched:) forControlEvents:UIControlEventValueChanged];
+    [self.view addSubview:logSwitch];
+    
+    // Switch Label
+    UILabel *switchLabel = [[UILabel alloc] initWithFrame:CGRectMake(self.view.frame.size.width - 130, 45, 60, 20)];
+    switchLabel.text = @"Active:";
+    switchLabel.textColor = [UIColor whiteColor];
+    switchLabel.font = [UIFont systemFontOfSize:12];
+    switchLabel.textAlignment = NSTextAlignmentRight;
+    [self.view addSubview:switchLabel];
+    
     [self refreshLogs];
+}
+
+- (void)loggingSwitched:(UISwitch *)sender {
+    [LogManager sharedInstance].isEnabled = sender.isOn;
 }
 
 - (void)closeTapped {
