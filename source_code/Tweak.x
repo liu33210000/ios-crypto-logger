@@ -330,9 +330,19 @@ static BOOL ShouldLogBase64(void) {
 
 @implementation FloatingWindow
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    // Only capture touches on the subviews (the button), let others pass through
+    // Only capture touches on subviews that are userinteractive and not hidden
     for (UIView *view in self.subviews) {
         if (!view.hidden && view.userInteractionEnabled && [view pointInside:[self convertPoint:point toView:view] withEvent:event]) {
+            // Special check: ensure we don't capture the root view itself if it's full screen
+            if (view == self.rootViewController.view) {
+                // Recursively check root view's subviews (the button)
+                for (UIView *subview in view.subviews) {
+                    if (!subview.hidden && subview.userInteractionEnabled && [subview pointInside:[view convertPoint:point toView:subview] withEvent:event]) {
+                        return YES;
+                    }
+                }
+                continue; // Don't return YES for the root view itself
+            }
             return YES;
         }
     }
@@ -411,6 +421,7 @@ static BOOL ShouldLogBase64(void) {
     self.window.backgroundColor = [UIColor clearColor];
     self.window.rootViewController = [[UIViewController alloc] init];
     self.window.rootViewController.view.backgroundColor = [UIColor clearColor];
+    self.window.rootViewController.view.userInteractionEnabled = NO; // CRITICAL: Let touches pass through root view
     self.window.hidden = NO;
     
     // Make sure window is key and visible
@@ -427,6 +438,7 @@ static BOOL ShouldLogBase64(void) {
     [self.button setTitle:@"LOG" forState:UIControlStateNormal];
     [self.button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     self.button.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    self.button.userInteractionEnabled = YES; // Ensure button catches touches
     [self.button addTarget:self action:@selector(buttonTapped) forControlEvents:UIControlEventTouchUpInside];
     
     // Add pan gesture
@@ -479,7 +491,7 @@ static BOOL ShouldLogBase64(void) {
 %ctor {
     NSLog(@"[CryptoMonitor] Loaded");
     // Initialize Floating UI with delay to ensure app UI is ready
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [[FloatingController sharedInstance] setup];
     });
 }
