@@ -329,25 +329,23 @@ static BOOL ShouldLogBase64(void) {
 @end
 
 @implementation FloatingWindow
-- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    // Only capture touches on subviews that are userinteractive and not hidden
-    for (UIView *view in self.subviews) {
-        if (!view.hidden && view.userInteractionEnabled && [view pointInside:[self convertPoint:point toView:view] withEvent:event]) {
-            // Special check: ensure we don't capture the root view itself if it's full screen
-            if (view == self.rootViewController.view) {
-                // Recursively check root view's subviews (the button)
-                for (UIView *subview in view.subviews) {
-                    if (!subview.hidden && subview.userInteractionEnabled && [subview pointInside:[view convertPoint:point toView:subview] withEvent:event]) {
-                        return YES;
-                    }
-                }
-                continue; // Don't return YES for the root view itself
-            }
-            return YES;
-        }
+
+// Override hitTest to implement pass-through touch handling
+// This is the correct iOS pattern for transparent overlay windows
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    // Let the system find the deepest view at this point
+    UIView *hitView = [super hitTest:point withEvent:event];
+    
+    // If the touch lands on the window itself, rootViewController.view,
+    // or nil - let it pass through to the app below
+    if (hitView == nil || hitView == self || hitView == self.rootViewController.view) {
+        return nil; // Returning nil passes touch to windows below
     }
-    return NO;
+    
+    // Touch hit an actual interactive element (the button) - handle it
+    return hitView;
 }
+
 @end
 
 @interface FloatingController : NSObject
